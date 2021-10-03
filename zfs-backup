@@ -74,7 +74,7 @@ end
 
 if update
   puts "Updating zfs-backup..."
-  `curl http://mad.xan.pl/p2/zfs-backup > ~/bin/zfs-backup && chmod 755 ~/bin/zfs-backup`
+  `curl https://raw.githubusercontent.com/madmax/zfs-backup/main/zfs-backup > ~/bin/zfs-backup && chmod 755 ~/bin/zfs-backup`
   puts "Done."
   exit
 end
