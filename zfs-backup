@@ -1,0 +1,334 @@
+#! /usr/bin/env ruby
+#############################################################################
+# EXAMPLE
+#
+# zfs-backup sys/mysql sys/backup --host=localhost --mysql --keep=5 --log=/var/log/backup.log
+#
+require 'logger'
+require 'date'
+require 'getoptlong'
+require 'open-uri'
+
+opts = GetoptLong.new(
+  [ "--user", "-u", GetoptLong::REQUIRED_ARGUMENT ],
+  [ "--host", "-h", GetoptLong::REQUIRED_ARGUMENT ],
+  [ "--mysql", "-m", GetoptLong::NO_ARGUMENT ],
+  [ "--keep",  "-k", GetoptLong::REQUIRED_ARGUMENT ],
+  [ "--init",  "-i", GetoptLong::NO_ARGUMENT ],
+  [ "--update", GetoptLong::NO_ARGUMENT ],
+  [ "--log",  "-l", GetoptLong::REQUIRED_ARGUMENT ],
+  [ "--recursive",  "-r", GetoptLong::NO_ARGUMENT ]
+)
+
+host = "localhost"
+user = "zfs"
+keep = 5
+mysql = false
+incremental = true
+logger = STDOUT
+$debug = false
+update = false
+recursive = false
+
+
+opts.each do |opt, arg|
+  case opt
+  when '--user'
+    user = arg
+  when '--host'
+    host = arg
+  when '--log'
+    logger = arg
+  when '--init'
+    incremental = false
+  when '--keep'
+    keep = arg.to_i
+  when '--mysql'
+    mysql = true
+  when '--update'
+    update = true
+  when '--recursive'
+    recursive = true
+  end
+end
+
+
+def usage
+  puts <<-EOF
+Usage: #{$0} [-hkm] <SOURCE> <DESTINATION>
+  EOF
+  format = "    %-15s %s"
+  puts format % ["--user=USER", "destination user (default: zfs)"]
+  puts format % ["--host=HOST", "destination host (default: localhost)"]
+  puts format % ["--keep=DAYS", "How many days keept old backups (default: 5)"]
+  puts format % ["--mysql", "Do mysql backup (lock tables)"]
+  puts format % ["--init", "Do init backup"]
+  puts format % ["--update", "Update zfs-backup"]
+  puts format % ["--log", "Log file where writte all messages (default: STDOUT)"]
+  puts format % ["--recursive", "Recursive backup"]
+  puts format % ["SOURCE", "The interval to snapshot."]
+  puts format % ["DESTINATION", "How many snapshots to keep."]
+  exit
+end
+
+
+if update
+  puts "Updating zfs-backup..."
+  `curl http://mad.xan.pl/p2/zfs-backup > ~/bin/zfs-backup && chmod 755 ~/bin/zfs-backup`
+  puts "Done."
+  exit
+end
+
+usage if ARGV.length < 2
+
+source=ARGV[0]
+destination=ARGV[1]
+
+
+$logger = Logger.new(logger)
+###############################################################################
+# Classes
+#
+#
+class Backup
+
+  def initialize(source, destination, host, user, mysql, keep, incremental, recursive)
+    @source = source
+    @destination = destination
+    @host = host
+    @user = user
+    @mysql = mysql
+    @keep = keep.to_i
+    @incremental = incremental
+    @recursive = recursive
+  end
+
+  def date
+    DateTime.now
+  end
+
+  def format_date(date)
+    date.strftime("%F")
+  end
+
+  def current
+    format_date date
+  end
+
+  def oldest
+    format_date date - @keep
+  end
+
+  def previous(offset = 1)
+    format_date date - offset
+  end
+
+  def find_previous
+    (1..@keep).map { |offset| snapshot_name previous(offset) }.find { |snapshot| snapshot_exists?(snapshot) }
+  end
+
+  def snapshot_name(date)
+    [@source, date].join("@")
+  end
+
+  def snapshots(name = nil)
+    Zfs::Snapshot.list(name || @source)
+  end
+
+  def snapshot_exists?(name)
+    snapshots.any? do |snapshot|
+      snapshot.name == name
+    end
+  end
+
+  def create_snapshot(name)
+    options = {}
+    options['db'] = "mysql" if @mysql
+    options['recursive']  = true if @recursive
+    Zfs::Snapshot.create(name, options)
+  end
+
+  def transfer_snapshot(name, previous_name = nil)
+    log_and_raise "Snapshot #{name} not exists" unless snapshot_exists?(name)
+    log_and_raise "Previous snapshot #{previous_name} not exists" if previous_name && !snapshot_exists?(previous_name)
+
+    begin
+      snapshot = snapshots(name).first
+      snapshot.transfer(@destination, @host, @user, previous_name, @recursive)
+    rescue Exception => e
+      log_and_raise(e)
+    end
+  end
+
+  def remove_snapshot(name)
+    snapshot = snapshots(name).first
+    options = {}
+    options['recursive']  = true if @recursive
+    snapshot.destroy(options)
+  end
+
+  def log_and_raise(message, level = :error)
+    log(message, level)
+    mail(message)
+    raise message
+  end
+
+  def log(message, level = :info)
+    $logger.send(level, message)
+  end
+
+  def mail(message)
+    `mail -s "Backup Error" root<<EOM
+    Error message:
+
+    #{message}
+
+    System Varibles:
+
+    source: #{@source}
+    destination: #{@destination}
+    host: #{@host}
+    user: #{@user}
+    mysql: #{@mysql}
+    keep: #{@keep}
+    incremental: #{@incremental}
+    date: #{date}
+    ----------------------------------------
+    `
+  end
+
+  def perform
+    current_snapshot_name = snapshot_name(current)
+    previous_snapshot_name = find_previous
+    oldes_snapshot_name = snapshot_name(oldest)
+
+    # validate snapshots
+    #
+    if snapshot_exists?(current_snapshot_name)
+      log_and_raise("Current #{current_snapshot_name} snapshot exists")
+    end
+
+    if @incremental && !previous_snapshot_name
+      log_and_raise("Can't find previous snapshot")
+    end
+
+    log "Create snapshot #{current_snapshot_name}"
+    create_snapshot current_snapshot_name
+
+    if @incremental
+      log "Transfering snapshot diff #{current_snapshot_name} >> #{previous_snapshot_name}"
+      transfer_snapshot current_snapshot_name, previous_snapshot_name
+    else
+      log "Transfering initial snapshot #{current_snapshot_name}"
+      transfer_snapshot current_snapshot_name
+    end
+
+    if snapshot_exists?(oldes_snapshot_name)
+      log "Removing old snapshont #{oldes_snapshot_name}"
+      remove_snapshot oldes_snapshot_name
+    end
+  end
+end
+
+module Zfs
+  class Snapshot
+    @@stale_snapshot_size = false
+    attr_reader :name
+    def initialize(name, used=nil)
+      @name = name
+      @used = used
+    end
+
+    def used
+      if @used.nil? or @@stale_snapshot_size
+        cmd = "zfs get -Hp -o value used #{@name}"
+        puts cmd if $debug
+        @used = %x[#{cmd}].to_i
+      end
+      @used
+    end
+
+    def is_zero?
+      if @used != 0
+        return false
+      end
+      used
+    end
+
+    ### List all snapshots
+    def self.list(dataset=nil, options={})
+      snapshots = []
+      flags=[]
+      flags << "-d 1" if dataset and !options['recursive']
+      flags << "-r" if options['recursive']
+      cmd = "zfs list #{flags.join(" ")} -H -t snapshot -o name,used -S name"
+      cmd += " #{dataset}" if dataset
+      puts cmd if $debug
+      IO.popen cmd do |io|
+        io.readlines.each do |line|
+          line.chomp!
+          snapshot_name,used = line.split(' ')
+          snapshots << self.new(snapshot_name, used.to_i)
+        end
+      end
+      snapshots
+    end
+
+    ### Create a snapshot
+    def self.create(snapshot, options = {})
+      flags=[]
+      flags << "-r" if options['recursive']
+      cmd = "zfs snapshot #{flags.join(" ")} #{snapshot}"
+
+      if options['db']
+        case options['db']
+        when 'mysql'
+          sql_query=<<-EOF.gsub(/^ {10}/, '')
+
+            FLUSH LOGS;
+            FLUSH TABLES WITH READ LOCK;
+            SYSTEM #{cmd};
+            UNLOCK TABLES;
+          EOF
+          cmd = %Q[mysql -e "#{sql_query}"]
+        end
+      end
+
+      puts cmd if $debug || $verbose
+      system(cmd) unless $dry_run
+    end
+
+    def transfer(destination, host, user, previous_snapshot = nil, recursive = false)
+      if previous_snapshot
+        previous_snapshot = "-i #{previous_snapshot}"
+      end
+
+      options = []
+      options << "-R" if recursive
+
+      cmd = "zfs send #{options.join(" ")} -v #{previous_snapshot} #{name} | ssh #{user}@#{host} 'zfs receive -Fduv #{destination}'"
+
+      puts cmd if $debug
+      unless $dry_run
+        raise "Failed transfering snapshot #{name} to #{destination}" unless system(cmd)
+      end
+    end
+
+    ### Destroy a snapshot
+    def destroy(options = {})
+      # If destroying a snapshot, need to flag all other snapshot sizes as stale
+      # so they will be relooked up.
+      @@stale_snapshot_size = true
+      # Default to deferred snapshot destroying
+      flags=["-d"]
+      flags << "-r" if options['recursive']
+      cmd = "zfs destroy #{flags.join(" ")} #{@name}"
+      puts cmd if $debug
+      system(cmd) unless $dry_run
+    end
+
+  end
+end
+
+backup = Backup.new(source, destination, host, user, mysql, keep, incremental, recursive)
+backup.perform
