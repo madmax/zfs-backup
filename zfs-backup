@@ -303,10 +303,15 @@ module Zfs
         previous_snapshot = "-i #{previous_snapshot}"
       end
 
-      options = []
-      options << "-R" if recursive
+      send_options = []
+      send_options << "-R" if recursive
 
-      cmd = "zfs send #{options.join(" ")} -v #{previous_snapshot} #{name} | ssh #{user}@#{host} 'zfs receive -Fduv #{destination}'"
+      recive_options = []
+      # -F force rollback to last snapshot but if we use it with recursive option it try delete old snapshots on reciving site
+      # for security reasone we don't allow it.
+      recive_options << "-F" unless recursive
+
+      cmd = "zfs send #{send_options.join(" ")} -v #{previous_snapshot} #{name} | ssh #{user}@#{host} 'zfs receive -duv #{recive_options.join(" ")} #{destination}'"
 
       puts cmd if $debug
       unless $dry_run
