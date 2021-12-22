@@ -17,7 +17,8 @@ opts = GetoptLong.new(
   [ "--init",  "-i", GetoptLong::NO_ARGUMENT ],
   [ "--update", GetoptLong::NO_ARGUMENT ],
   [ "--log",  "-l", GetoptLong::REQUIRED_ARGUMENT ],
-  [ "--recursive",  "-r", GetoptLong::NO_ARGUMENT ]
+  [ "--recursive",  "-r", GetoptLong::NO_ARGUMENT ],
+  [ "--sentry-dsn", GetoptLong::REQUIRED_ARGUMENT]
 )
 
 host = "localhost"
@@ -29,6 +30,7 @@ logger = STDOUT
 $debug = false
 update = false
 recursive = false
+sentry_dsn =  nil
 
 
 opts.each do |opt, arg|
@@ -49,9 +51,10 @@ opts.each do |opt, arg|
     update = true
   when '--recursive'
     recursive = true
+  when "--sentry-dsn"
+    sentry_dsn = arg
   end
 end
-
 
 def usage
   puts <<-EOF
@@ -66,17 +69,26 @@ Usage: #{$0} [-hkm] <SOURCE> <DESTINATION>
   puts format % ["--update", "Update zfs-backup"]
   puts format % ["--log", "Log file where writte all messages (default: STDOUT)"]
   puts format % ["--recursive", "Recursive backup"]
+  puts format % ["--sentry-dsn=URL", "sentry dns report errors (default: nil)"]
   puts format % ["SOURCE", "The interval to snapshot."]
   puts format % ["DESTINATION", "How many snapshots to keep."]
   exit
 end
-
 
 if update
   puts "Updating zfs-backup..."
   `curl https://raw.githubusercontent.com/madmax/zfs-backup/main/zfs-backup > ~/bin/zfs-backup && chmod 755 ~/bin/zfs-backup`
   puts "Done."
   exit
+end
+
+if sentry_dsn
+  require 'sentry-ruby'
+
+  Sentry.init do |config|
+    config.dsn = sentry_dsn
+    config.background_worker_threads = 0
+  end
 end
 
 usage if ARGV.length < 2
@@ -169,7 +181,7 @@ class Backup
 
   def log_and_raise(message, level = :error)
     log(message, level)
-    mail(message)
+    sentry(message)
     raise message
   end
 
@@ -177,24 +189,24 @@ class Backup
     $logger.send(level, message)
   end
 
-  def mail(message)
-    `mail -s "Backup Error" root<<EOM
-    Error message:
+  def sentry(message)
+    return unless defined?(Sentry)
 
-    #{message}
-
-    System Varibles:
-
-    source: #{@source}
-    destination: #{@destination}
-    host: #{@host}
-    user: #{@user}
-    mysql: #{@mysql}
-    keep: #{@keep}
-    incremental: #{@incremental}
-    date: #{date}
-    ----------------------------------------
-    `
+    Sentry.capture_message(
+      message,
+      contexts: {
+        data: {
+          source: @source,
+          destination: @destination,
+          host: @host,
+          user: @user,
+          mysql: @mysql,
+          keep: @keep,
+          incremental: @incremental,
+          date: date,
+        }
+      }
+    )
   end
 
   def perform
